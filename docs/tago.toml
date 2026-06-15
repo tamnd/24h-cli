@@ -1,0 +1,10 @@
+title       = "24h"
+baseURL     = "https://24h-cli.tamnd.com/"
+description = "A command line for 24h."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/24h-cli"
