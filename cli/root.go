@@ -4,7 +4,7 @@ package cli
 
 import (
 	"github.com/tamnd/any-cli/kit"
-	"github.com/tamnd/24h-cli/24h"
+	h24 "github.com/tamnd/24h-cli/24h"
 )
 
 // Build metadata, set via -ldflags at release time.
@@ -24,11 +24,11 @@ var (
 // appears here automatically. Reach for app.AddCommand only for a verb that does
 // not fit the emit-records shape, the way version does below.
 func NewApp() *kit.App {
-	id := 24h.Domain{}.Info().Identity
+	id := h24.Domain{}.Info().Identity
 	id.Version = Version
 
 	app := kit.New(id)
-	(24h.Domain{}).Register(app)
+	(h24.Domain{}).Register(app)
 	app.AddCommand(newVersionCmd())
 	return app
 }

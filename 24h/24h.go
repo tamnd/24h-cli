@@ -1,62 +1,98 @@
-// Package 24h is the library behind the 24h command line:
-// the HTTP client, request shaping, and the typed data models for 24h.
+// Package h24 is the library behind the 24h command line:
+// the HTTP client, RSS feed parsing, and typed data models for 24h
+// (24h.com.vn), Vietnam's seventh-most-visited news website.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
-package 24h
+// 24h publishes per-category RSS 2.0 feeds. Article URLs embed a numeric ID
+// in the pattern: https://www.24h.com.vn/{cat}/{slug}-c{cat_id}-{id}.html.
+package h24
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to 24h. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "24h/dev (+https://github.com/tamnd/24h-cli)"
+// Host is the canonical site hostname.
+const Host = "24h.com.vn"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at 24h.com; change it once you
-// know the real endpoints you want to read.
-const Host = "24h.com"
+// baseURL is the site root.
+const baseURL = "https://www.24h.com.vn"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// DefaultUserAgent identifies this client to 24h.
+const DefaultUserAgent = "24h-cli/0.1.0 (+https://github.com/tamnd/24h-cli)"
 
-// Client talks to 24h over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+// Categories lists the 24h RSS feed category slugs.
+var Categories = []string{
+	"tin-tuc-trong-ngay",
+	"bong-da",
+	"the-thao",
+	"giai-tri",
+	"sao-viet",
+	"xa-hoi",
+	"kinh-doanh",
+	"phap-luat",
+	"suc-khoe",
+	"oto-xe-may",
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+var categoryNames = map[string]string{
+	"tin-tuc-trong-ngay": "Tin tức trong ngày",
+	"bong-da":            "Bóng đá",
+	"the-thao":           "Thể thao",
+	"giai-tri":           "Giải trí",
+	"sao-viet":           "Sao Việt",
+	"xa-hoi":             "Xã hội",
+	"kinh-doanh":         "Kinh doanh",
+	"phap-luat":          "Pháp luật",
+	"suc-khoe":           "Sức khỏe",
+	"oto-xe-may":         "Ô tô xe máy",
+}
+
+// Config holds the tunable knobs for the HTTP client.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
+	UserAgent string
+}
+
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to 24h RSS feeds over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client from DefaultConfig.
+func NewClient() *Client { return NewClientWithConfig(DefaultConfig()) }
+
+// NewClientWithConfig returns a Client built from cfg.
+func NewClientWithConfig(cfg Config) *Client {
+	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.Timeout}}
+}
+
+// Get fetches rawURL and returns the body, pacing and retrying.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +100,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +109,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml, */*")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -98,18 +135,14 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	}
 
 	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
+	return b, err != nil, err
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +156,231 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on 24h.com. It is a stand-in for the typed records you
-// will model from the real 24h endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `24h cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types ---
+
+type wireRSS struct {
+	XMLName xml.Name    `xml:"rss"`
+	Channel wireChannel `xml:"channel"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+type wireChannel struct {
+	Title string     `xml:"title"`
+	Items []wireItem `xml:"item"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+type wireItem struct {
+	Title       string        `xml:"title"`
+	Link        string        `xml:"link"`
+	Description string        `xml:"description"`
+	PubDate     string        `xml:"pubDate"`
+	Author      string        `xml:"author"`
+	Creator     string        `xml:"creator"`
+	Thumb       string        `xml:"thumb"`
+	Enclosure   wireEnclosure `xml:"enclosure"`
+}
+
+type wireEnclosure struct {
+	URL  string `xml:"url,attr"`
+	Type string `xml:"type,attr"`
+}
+
+// --- public types ---
+
+// Article is one 24h news article extracted from an RSS feed.
+type Article struct {
+	ID          string `json:"id"                   kit:"id" table:"id"`
+	Title       string `json:"title"                          table:"title"`
+	URL         string `json:"url,omitempty"                  table:"url,url"`
+	Category    string `json:"category,omitempty"             table:"category"`
+	Description string `json:"description,omitempty"          table:"-"`
+	Author      string `json:"author,omitempty"               table:"author"`
+	Thumbnail   string `json:"thumbnail,omitempty"            table:"-"`
+	PublishedAt string `json:"published_at,omitempty"         table:"published_at"`
+}
+
+// Category represents one 24h RSS feed category.
+type Category struct {
+	Slug string `json:"slug" kit:"id" table:"slug"`
+	Name string `json:"name"          table:"name"`
+	URL  string `json:"url"           table:"url,url"`
+	RSS  string `json:"rss"           table:"-"`
+}
+
+// --- client methods ---
+
+// LatestArticles fetches the most recent articles from the main news feed.
+func (c *Client) LatestArticles(ctx context.Context, limit int) ([]*Article, error) {
+	return c.CategoryArticles(ctx, "tin-tuc-trong-ngay", limit)
+}
+
+// CategoryArticles fetches articles for the given category slug.
+func (c *Client) CategoryArticles(ctx context.Context, slug string, limit int) ([]*Article, error) {
+	if limit <= 0 {
+		limit = 20
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
+	body, err := c.Get(ctx, c.rssURL(slug))
+	if err != nil {
+		return nil, fmt.Errorf("feed %s: %w", slug, err)
+	}
+	items, err := parseRSS(body)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", slug, err)
+	}
+	out := make([]*Article, 0, len(items))
+	for _, item := range items {
+		a := articleFromWire(item, slug)
+		if a == nil {
 			continue
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
+		out = append(out, a)
+		if len(out) >= limit {
 			break
 		}
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// SearchArticles keyword-searches several category feeds.
+func (c *Client) SearchArticles(ctx context.Context, query string, limit int) ([]*Article, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	q := strings.ToLower(query)
+	seen := map[string]bool{}
+	var out []*Article
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+	for _, slug := range []string{"tin-tuc-trong-ngay", "xa-hoi", "kinh-doanh", "giai-tri", "bong-da"} {
+		if len(out) >= limit {
+			break
 		}
+		body, err := c.Get(ctx, c.rssURL(slug))
+		if err != nil {
+			continue
+		}
+		items, err := parseRSS(body)
+		if err != nil {
+			continue
+		}
+		for _, item := range items {
+			if len(out) >= limit {
+				break
+			}
+			a := articleFromWire(item, slug)
+			if a == nil || seen[a.ID] {
+				continue
+			}
+			if strings.Contains(strings.ToLower(a.Title), q) ||
+				strings.Contains(strings.ToLower(a.Description), q) {
+				seen[a.ID] = true
+				out = append(out, a)
+			}
+		}
+	}
+	return out, nil
+}
+
+// ListCategories returns all known 24h RSS feed categories.
+func (c *Client) ListCategories() []*Category {
+	base := c.cfg.BaseURL
+	if base == "" {
+		base = baseURL
+	}
+	out := make([]*Category, 0, len(Categories))
+	for _, slug := range Categories {
+		name := categoryNames[slug]
+		if name == "" {
+			name = slug
+		}
+		out = append(out, &Category{
+			Slug: slug,
+			Name: name,
+			URL:  base + "/" + slug + "/",
+			RSS:  c.rssURL(slug),
+		})
 	}
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+func (c *Client) rssURL(slug string) string {
+	base := c.cfg.BaseURL
+	if base == "" {
+		base = baseURL
+	}
+	return base + "/rss/" + slug + ".rss"
+}
+
+// --- parsing ---
+
+func parseRSS(body []byte) ([]wireItem, error) {
+	var feed wireRSS
+	if err := xml.Unmarshal(body, &feed); err != nil {
+		return nil, fmt.Errorf("xml decode: %w", err)
+	}
+	return feed.Channel.Items, nil
+}
+
+// articleIDRE extracts the numeric article ID from 24h URLs.
+// Pattern: /{category}/{slug}-c{cat_id}-{id}.html — grab the last number.
+var articleIDRE = regexp.MustCompile(`-(\d{5,})\.html$`)
+
+// urlToID converts a 24h article URL to a stable identifier (its URL path).
+func urlToID(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Path == "" {
+		return rawURL
+	}
+	return strings.Trim(u.Path, "/")
+}
+
+func articleFromWire(item wireItem, category string) *Article {
+	link := strings.TrimSpace(item.Link)
+	if link == "" {
+		return nil
+	}
+	// 24h article URLs have complex path; use URL path as stable ID.
+	id := urlToID(link)
+
+	author := strings.TrimSpace(item.Author)
+	if author == "" {
+		author = strings.TrimSpace(item.Creator)
+	}
+
+	thumb := strings.TrimSpace(item.Thumb)
+	if thumb == "" && strings.HasPrefix(item.Enclosure.Type, "image/") {
+		thumb = item.Enclosure.URL
+	}
+
+	return &Article{
+		ID:          id,
+		Title:       strings.TrimSpace(item.Title),
+		URL:         link,
+		Category:    category,
+		Description: strings.TrimSpace(item.Description),
+		Author:      author,
+		Thumbnail:   thumb,
+		PublishedAt: parseRFC1123(item.PubDate),
+	}
+}
+
+// ExtractArticleID extracts the numeric ID from a 24h article URL.
+// Returns empty string if not found.
+func ExtractArticleID(rawURL string) string {
+	m := articleIDRE.FindStringSubmatch(rawURL)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func parseRFC1123(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	for _, layout := range []string{time.RFC1123Z, time.RFC1123, "Mon, 02 Jan 2006 15:04:05 -0700"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC().Format(time.RFC3339)
+		}
 	}
 	return s
 }
